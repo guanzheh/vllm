@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
+import functools
 import math
 
 import torch
@@ -37,7 +38,9 @@ from vllm.model_executor.kernels.attention.dsa.fused_mqa_topk import (
     get_fused_mqa_topk_workspaces,
     use_fused_mqa_topk,
 )
+from vllm.model_executor.kernels.attention.dsa.sparse_mqa_logits import has_deep_select
 from vllm.model_executor.layers.indexer_topk import (
+    _HAS_DEEP_SELECT_C,
     RADIX_TOPK_WORKSPACE_SIZE,
     deep_select_topk,
     get_indexer_topk,
@@ -119,18 +122,18 @@ def _merge_dcp_topk_global(
 ) -> None:
     """Merge each DCP rank's local top-K into the global top-K.
 
-    ``topk_indices`` are this rank's local top-K positions into its 1/N KV
+    `topk_indices` are this rank's local top-K positions into its 1/N KV
     shard. A token in the global top-K must also be in its owning rank's local
-    top-K (at most ``topk_tokens - 1`` tokens rank globally above it, hence at
+    top-K (at most `topk_tokens - 1` tokens rank globally above it, hence at
     most that many on its own rank), so exchanging only the per-rank local
     candidates is exact -- equivalent to all-gathering the full logit matrix,
-    but it ships ``dcp_world_size * topk_tokens`` candidates instead of the whole
-    score row. Overwrites ``topk_indices`` with global token ids (``-1`` for
+    but it ships `dcp_world_size * topk_tokens` candidates instead of the whole
+    score row. Overwrites `topk_indices` with global token ids (`-1` for
     padding); the attention backend localizes them back to physical slots per
     rank.
-    The selector keys only the score bits that ``logits_dtype`` (the dtype the
+    The selector keys only the score bits that `logits_dtype` (the dtype the
     MQA logits were computed in, before the FP32 upcast) carries and the id
-    bits that positions below ``num_positions`` use.
+    bits that positions below `num_positions` use.
     """
     if dcp_world_size <= 1:
         return
@@ -329,10 +332,26 @@ def _upcast_logits_kernel(src_ptr, dst_ptr, row_ends_ptr, stride, BLOCK: tl.cons
         tl.store(dst_ptr + offs, vals.to(tl.float32), mask=mask)
 
 
+@functools.cache
+def _prefill_uses_deep_select(topk_backend: str, batch_invariant: bool) -> bool:
+    """Whether prefill chunks rank their BF16 logits with DeepSelect: always for
+    "deep_select", and for "auto" wherever DeepSelect runs (SM100/SM103) and its
+    extension loaded, unless batch-invariant mode is on. Cached:
+    `has_deep_select` calls `find_spec`."""
+    if topk_backend == "deep_select":
+        return True
+    return (
+        topk_backend == "auto"
+        and not batch_invariant
+        and _HAS_DEEP_SELECT_C
+        and has_deep_select()
+    )
+
+
 def as_fp32_logits(logits: torch.Tensor, row_ends: torch.Tensor) -> torch.Tensor:
     """Upcast BF16 MQA logits for the FP32 top-k kernels.
 
-    Only columns below ``row_ends`` (int32, one per row) are converted, the
+    Only columns below `row_ends` (int32, one per row) are converted, the
     span the consumers read; DeepGEMM's aligned row stride is kept.
     """
     if logits.dtype == torch.float32:
@@ -356,7 +375,7 @@ def _decode_chunk_ranges(
     rows: int, width: int, budget: int, itemsize: int
 ) -> list[tuple[int, int]]:
     """Partition independent Q rows under a payload budget of logits whose
-    elements take ``itemsize`` bytes."""
+    elements take `itemsize` bytes."""
     if budget < 0:
         raise ValueError("Decode logits budget must be nonnegative")
     if not rows or not budget or rows * width * itemsize <= budget:
@@ -396,7 +415,7 @@ def _varlen_decode_rows(
     end: int,
 ) -> None:
     """The varlen (SM100) decode logits, candidate selection and top-k of rows
-    ``[start, end)``, with the slice's own DeepGEMM schedule."""
+    `[start, end)`, with the slice's own DeepGEMM schedule."""
     assert decode.indices is not None
     seq_lens = decode.seq_lens[start:end]
     indices = decode.indices[start:end]
@@ -475,7 +494,7 @@ def kv_cache_as_quant_view(
     head_dim: int,
     use_fp4_cache: bool,
 ) -> torch.Tensor:
-    """4D ``[num_blocks, block_size, 1, head_width]`` view expected by
+    """4D `[num_blocks, block_size, 1, head_width]` view expected by
     DeepGEMM, from the 3D indexer kv-cache allocation."""
     if use_fp4_cache:
         assert kv_cache.ndim == 3 and kv_cache.dtype == torch.uint8
@@ -542,6 +561,9 @@ def sparse_attn_indexer(
         full_context=use_pcp or dcp_world_size == 1,
         candidate_selection=candidate_blocks is not None,
     )
+    prefill_deep_select = _prefill_uses_deep_select(
+        topk_backend, envs.VLLM_BATCH_INVARIANT
+    )
 
     # DeepSelect ranks BF16 decode logits directly; other top-k backends and
     # the DCP merge read an FP32 copy.
@@ -596,8 +618,10 @@ def sparse_attn_indexer(
         # prefill chunk's, or the decode logits, which eager and piecewise
         # steps allocate outside the CUDA graph pools. DeepGEMM emits them in
         # `logits_dtype`, each row holding whole KV splits at a 1024-byte
-        # stride; an FP32 copy of BF16 logits keeps that stride. Prefill always
-        # reads FP32 logits, and the chunk splitter caps them at the budget.
+        # stride; an FP32 copy of BF16 logits keeps that stride. The chunk
+        # splitter caps prefill logits at the budget in FP32. DeepSelect ranks
+        # BF16 logits without the copy, but the bound keeps it for chunks that
+        # DeepSelect does not take (e.g. under DCP).
         split_kv = 384 if current_platform.is_device_capability_family(100) else 256
         row_align = math.lcm(split_kv, 1024 // logits_dtype.itemsize)
         copy_bytes = 0 if logits_dtype == torch.float32 else torch.float32.itemsize
@@ -759,10 +783,12 @@ def sparse_attn_indexer(
             scales_spec,
             *gather_specs,
         )
-        # Under ShardQ the chunks index the shardq_gather_indices tokens.
+        # Under ShardQ the chunks index the shardq_gather_indices tokens. The
+        # caller may have computed the query and weights of just those.
         prefill_q, prefill_q_scale, prefill_weights = q_quant, q_scale, weights
-        if (indices := prefill_metadata.shardq_gather_indices) is not None:
-            assert candidate_blocks is None
+        indices = prefill_metadata.shardq_gather_indices
+        assert indices is None or candidate_blocks is None
+        if indices is not None and q_quant.shape[0] != indices.shape[0]:
             prefill_q, prefill_weights = q_quant[indices], weights[indices]
             if q_scale is not None:
                 prefill_q_scale = q_scale[indices]
@@ -889,7 +915,7 @@ def sparse_attn_indexer(
                         # DeepSelect ranks the bf16 logits in place of their exact
                         # fp32 copy; fp32 logits keep the per-row top-k.
                         use_deep_select = (
-                            topk_backend == "deep_select"
+                            prefill_deep_select
                             and logits.dtype == torch.bfloat16
                             and dcp_world_size == 1
                             and is_deep_select_supported(logits, topk_tokens)
@@ -1440,12 +1466,12 @@ class SparseAttnIndexer(CustomOp):
         """CPU sparse attention indexer: cache write stays eager Python glue
         (own K-cache layout, not shared with the main attention cache
         write). PREFILL and DECODE both call the ported
-        ``fp8_paged_mqa_logits_cpu``/``topk_transform_512_cpu`` kernels,
-        which read the paged K-cache directly via ``page_table`` -- no
+        `fp8_paged_mqa_logits_cpu`/`topk_transform_512_cpu` kernels,
+        which read the paged K-cache directly via `page_table` -- no
         eager gather step, no per-request Python loop.
 
-        ``prefill_metadata.chunks`` always has exactly one entry here:
-        ``DeepseekV4CPUIndexerMetadataBuilder`` overrides the base chunk
+        `prefill_metadata.chunks` always has exactly one entry here:
+        `DeepseekV4CPUIndexerMetadataBuilder` overrides the base chunk
         split to always return the whole step's prefill batch as one
         chunk, since the base chunking only bounds CUDA/XPU's dense M*N
         logits tensor and flat K-gather workspace, neither of which this
